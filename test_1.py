@@ -55,12 +55,8 @@ df[label_cols] = df[label_cols].astype(int)
 
 train_texts, val_texts, train_labels, val_labels = train_test_split(df['text'], df[label_cols], test_size=0.2, random_state=42)
 
-# Tokenizer and Dataloaders
+# Tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-train_dataset = CustomDataset(train_texts.tolist(), train_labels.values, tokenizer, max_len=512)
-val_dataset = CustomDataset(val_texts.tolist(), val_labels.values, tokenizer, max_len=512)
-train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
 
 # Model, optimizer, loss, scheduler
 model = BertMultiLabelClassifier()
@@ -69,11 +65,9 @@ model.to(device)
 
 optimizer = AdamW(model.parameters(), lr=2e-5)
 loss_fn = nn.BCEWithLogitsLoss()
-epochs = 10  # Increased for better convergence
-total_steps = len(train_loader) * epochs
-scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+epochs = 10
 
-# Auto-detect latest checkpoint
+best_f1 = 0.0
 start_epoch = 0
 checkpoint_files = [f for f in os.listdir('.') if re.match(r'checkpoint_epoch_\d+\.pt', f)]
 if checkpoint_files:
@@ -81,34 +75,46 @@ if checkpoint_files:
     checkpoint = torch.load(latest_checkpoint, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     start_epoch = checkpoint['epoch'] + 1
     print(f"Resumed from checkpoint: {latest_checkpoint} (epoch {start_epoch})")
 
-best_f1 = 0.0
-
-# Training loop
+# Training loop with chunked dataloading to prevent RAM crash
+chunk_size = 40000
+num_chunks = int(np.ceil(len(train_texts) / chunk_size))
 for epoch in range(start_epoch, epochs):
     model.train()
     total_loss = 0
-    loop = tqdm(train_loader, leave=True)
-    for batch in loop:
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
 
-        optimizer.zero_grad()
-        logits = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = loss_fn(logits, labels)
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+    for chunk_id in range(num_chunks):
+        start_idx = chunk_id * chunk_size
+        end_idx = min(start_idx + chunk_size, len(train_texts))
+        chunk_texts = train_texts[start_idx:end_idx].tolist()
+        chunk_labels = train_labels.values[start_idx:end_idx]
 
-        total_loss += loss.item()
-        loop.set_description(f"Epoch {epoch+1}")
-        loop.set_postfix(loss=loss.item())
+        train_dataset = CustomDataset(chunk_texts, chunk_labels, tokenizer, max_len=512)
+        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
 
-    print(f"Epoch {epoch+1}, Training Loss: {total_loss/len(train_loader):.4f}")
+        total_steps = len(train_loader)
+        scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+
+        loop = tqdm(train_loader, leave=True)
+        for batch in loop:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            optimizer.zero_grad()
+            logits = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            total_loss += loss.item()
+            loop.set_description(f"Epoch {epoch+1} Chunk {chunk_id+1}/{num_chunks}")
+            loop.set_postfix(loss=loss.item())
+
+    print(f"Epoch {epoch+1}, Training Loss: {total_loss/(num_chunks):.4f}")
 
     # Save checkpoint
     checkpoint_path = f'checkpoint_epoch_{epoch+1}.pt'
@@ -116,11 +122,12 @@ for epoch in range(start_epoch, epochs):
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict()
     }, checkpoint_path)
     print(f"Checkpoint saved: {checkpoint_path}")
 
     # Evaluation
+    val_dataset = CustomDataset(val_texts.tolist(), val_labels.values, tokenizer, max_len=512)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
     model.eval()
     all_preds = []
     all_labels = []
@@ -132,7 +139,7 @@ for epoch in range(start_epoch, epochs):
 
             logits = model(input_ids=input_ids, attention_mask=attention_mask)
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.3).int()  # Adjusted threshold
+            preds = (probs > 0.3).int()
 
             all_preds.append(preds.cpu().numpy())
             all_labels.append(labels.cpu().numpy())
@@ -142,7 +149,6 @@ for epoch in range(start_epoch, epochs):
     f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     print(f"Validation F1 Score: {f1:.4f}")
 
-    # Save best model by F1
     if f1 > best_f1:
         best_f1 = f1
         torch.save(model.state_dict(), 'best_model.pt')
