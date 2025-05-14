@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from transformers import BertTokenizer, BertModel, AdamW, get_scheduler
+from transformers import BertTokenizerFast, BertModel, AdamW, get_scheduler
 import pandas as pd
 import numpy as np
 from sklearn.metrics import f1_score
@@ -36,6 +36,7 @@ class BertMultiLabelClassifier(nn.Module):
     def __init__(self, model_name='bert-base-uncased', num_labels=3444):
         super(BertMultiLabelClassifier, self).__init__()
         self.bert = BertModel.from_pretrained(model_name)
+        self.bert.gradient_checkpointing_enable()  # Enable gradient checkpointing
         self.dropout = nn.Dropout(0.3)
         self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
 
@@ -56,7 +57,7 @@ df[label_cols] = df[label_cols].astype(int)
 train_texts, val_texts, train_labels, val_labels = train_test_split(df['text'], df[label_cols], test_size=0.2, random_state=42)
 
 # Tokenizer
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
 
 # Model, optimizer, loss, scheduler
 model = BertMultiLabelClassifier()
@@ -79,7 +80,7 @@ if checkpoint_files:
     print(f"Resumed from checkpoint: {latest_checkpoint} (epoch {start_epoch})")
 
 # Training loop with chunked dataloading to prevent RAM crash
-chunk_size = 40000
+chunk_size = 10000
 num_chunks = int(np.ceil(len(train_texts) / chunk_size))
 for epoch in range(start_epoch, epochs):
     model.train()
@@ -92,7 +93,7 @@ for epoch in range(start_epoch, epochs):
         chunk_labels = train_labels.values[start_idx:end_idx]
 
         train_dataset = CustomDataset(chunk_texts, chunk_labels, tokenizer, max_len=512)
-        train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
 
         total_steps = len(train_loader)
         scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=total_steps)
@@ -114,6 +115,9 @@ for epoch in range(start_epoch, epochs):
             loop.set_description(f"Epoch {epoch+1} Chunk {chunk_id+1}/{num_chunks}")
             loop.set_postfix(loss=loss.item())
 
+        del chunk_texts, chunk_labels, train_dataset, train_loader
+        torch.cuda.empty_cache()
+
     print(f"Epoch {epoch+1}, Training Loss: {total_loss/(num_chunks):.4f}")
 
     # Save checkpoint
@@ -127,7 +131,7 @@ for epoch in range(start_epoch, epochs):
 
     # Evaluation
     val_dataset = CustomDataset(val_texts.tolist(), val_labels.values, tokenizer, max_len=512)
-    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
     model.eval()
     all_preds = []
     all_labels = []
